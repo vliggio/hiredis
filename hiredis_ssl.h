@@ -156,6 +156,36 @@ int redisInitiateSSLWithContext(redisContext *c, redisSSLContext *redis_ssl_ctx)
 
 int redisInitiateSSL(redisContext *c, struct ssl_st *ssl);
 
+/**
+ * Return codes for redisSSLHandshake().
+ */
+#define REDIS_SSL_HANDSHAKE_DONE        0  /* Handshake completed successfully */
+#define REDIS_SSL_HANDSHAKE_WANT_READ   1  /* Wait for fd to be readable, then retry */
+#define REDIS_SSL_HANDSHAKE_WANT_WRITE  2  /* Wait for fd to be writable, then retry */
+/* A return value of REDIS_ERR (-1) means a fatal error; inspect c->err / c->errstr */
+
+/**
+ * Continue an in-progress SSL/TLS handshake on a non-blocking context.
+ *
+ * On a non-blocking socket, redisInitiateSSL() / redisInitiateSSLWithContext()
+ * may return REDIS_OK before the handshake has finished.  The caller must then
+ * use select(2) / poll(2) to wait for the socket and call this function
+ * repeatedly until REDIS_SSL_HANDSHAKE_DONE is returned:
+ *
+ *   while (1) {
+ *       int rc = redisSSLHandshake(c);
+ *       if (rc == REDIS_SSL_HANDSHAKE_DONE)  break;              // ready
+ *       if (rc == REDIS_ERR)                 handle_error(c);    // fatal
+ *       // rc is REDIS_SSL_HANDSHAKE_WANT_READ or _WANT_WRITE
+ *       wait_on_fd(c->fd, rc == REDIS_SSL_HANDSHAKE_WANT_READ);
+ *   }
+ *
+ * In async contexts the event loop drives handshake completion automatically
+ * via the SSL adapter's read/write callbacks; this function does not need to
+ * be called manually in that case.
+ */
+int redisSSLHandshake(redisContext *c);
+
 #ifdef __cplusplus
 }
 #endif

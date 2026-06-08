@@ -92,6 +92,14 @@ typedef struct redisSSL {
      * should resume whenever a read takes place, if possible
      */
     int pendingWrite;
+
+    /**
+     * Set to 1 once the SSL handshake has completed successfully.
+     * On non-blocking contexts this may be 0 after redisInitiateSSL() returns
+     * REDIS_OK, in which case the caller must drive the handshake to completion
+     * via redisSSLHandshake() (sync) or the event loop (async).
+     */
+    int handshakeDone;
 } redisSSL;
 
 /* Forward declaration */
@@ -374,6 +382,7 @@ static int redisSSLConnect(redisContext *c, SSL *ssl) {
 
     int rv = SSL_connect(rssl->ssl);
     if (rv == 1) {
+        rssl->handshakeDone = 1;
         c->funcs = &redisContextSSLFuncs;
         c->privctx = rssl;
         return REDIS_OK;
@@ -383,6 +392,7 @@ static int redisSSLConnect(redisContext *c, SSL *ssl) {
     if (((c->flags & REDIS_BLOCK) == 0) &&
         (rv == SSL_ERROR_WANT_READ || rv == SSL_ERROR_WANT_WRITE))
     {
+        /* handshakeDone remains 0; caller must resume via redisSSLHandshake() */
         c->funcs = &redisContextSSLFuncs;
         c->privctx = rssl;
         return REDIS_OK;
@@ -451,6 +461,52 @@ int redisInitiateSSLWithContext(redisContext *c, redisSSLContext *redis_ssl_ctx)
 error:
     if (ssl)
         SSL_free(ssl);
+    return REDIS_ERR;
+}
+
+/**
+ * Continue an in-progress SSL handshake on a non-blocking context.
+ *
+ * On a non-blocking socket, redisInitiateSSL() / redisInitiateSSLWithContext()
+ * may return REDIS_OK before the handshake is complete (SSL_connect returned
+ * SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE).  The caller must then wait for
+ * the socket to become ready and call this function repeatedly until it returns
+ * REDIS_SSL_HANDSHAKE_DONE or REDIS_ERR.
+ *
+ * Returns:
+ *   REDIS_SSL_HANDSHAKE_DONE  (0)  - handshake complete, context is ready
+ *   REDIS_SSL_HANDSHAKE_WANT_READ  - wait for the fd to become readable, retry
+ *   REDIS_SSL_HANDSHAKE_WANT_WRITE - wait for the fd to become writable, retry
+ *   REDIS_ERR                (-1)  - fatal error; check c->err / c->errstr
+ */
+int redisSSLHandshake(redisContext *c) {
+    redisSSL *rssl = c->privctx;
+
+    if (!rssl || rssl->handshakeDone)
+        return REDIS_SSL_HANDSHAKE_DONE;
+
+    ERR_clear_error();
+    int rv = SSL_connect(rssl->ssl);
+    if (rv == 1) {
+        rssl->handshakeDone = 1;
+        return REDIS_SSL_HANDSHAKE_DONE;
+    }
+
+    rv = SSL_get_error(rssl->ssl, rv);
+    if (rv == SSL_ERROR_WANT_READ)
+        return REDIS_SSL_HANDSHAKE_WANT_READ;
+    if (rv == SSL_ERROR_WANT_WRITE)
+        return REDIS_SSL_HANDSHAKE_WANT_WRITE;
+
+    char err[512];
+    if (rv == SSL_ERROR_SYSCALL)
+        snprintf(err, sizeof(err) - 1, "SSL_connect failed: %s", strerror(errno));
+    else {
+        unsigned long e = ERR_peek_last_error();
+        snprintf(err, sizeof(err) - 1, "SSL_connect failed: %s",
+                 ERR_reason_error_string(e));
+    }
+    __redisSetError(c, REDIS_ERR_IO, err);
     return REDIS_ERR;
 }
 
@@ -549,10 +605,38 @@ static ssize_t redisSSLWrite(redisContext *c) {
     return rv;
 }
 
+/* Drive the SSL handshake forward from within the async event loop.
+ * Called by redisSSLAsyncRead / redisSSLAsyncWrite when handshakeDone == 0.
+ * Registers the appropriate read/write event for the next iteration, or
+ * disconnects on fatal error. */
+static void redisSSLAsyncHandshake(redisAsyncContext *ac) {
+    int rv = redisSSLHandshake(&ac->c);
+
+    if (rv == REDIS_SSL_HANDSHAKE_DONE) {
+        /* Handshake complete — flush any buffered commands and start reading. */
+        _EL_ADD_READ(ac);
+        _EL_ADD_WRITE(ac);
+    } else if (rv == REDIS_SSL_HANDSHAKE_WANT_READ) {
+        _EL_DEL_WRITE(ac);
+        _EL_ADD_READ(ac);
+    } else if (rv == REDIS_SSL_HANDSHAKE_WANT_WRITE) {
+        _EL_DEL_READ(ac);
+        _EL_ADD_WRITE(ac);
+    } else {
+        /* Fatal error — __redisSetError already called by redisSSLHandshake */
+        __redisAsyncDisconnect(ac);
+    }
+}
+
 static void redisSSLAsyncRead(redisAsyncContext *ac) {
     int rv;
     redisSSL *rssl = ac->c.privctx;
     redisContext *c = &ac->c;
+
+    if (!rssl->handshakeDone) {
+        redisSSLAsyncHandshake(ac);
+        return;
+    }
 
     rssl->wantRead = 0;
 
@@ -583,6 +667,11 @@ static void redisSSLAsyncWrite(redisAsyncContext *ac) {
     int rv, done = 0;
     redisSSL *rssl = ac->c.privctx;
     redisContext *c = &ac->c;
+
+    if (!rssl->handshakeDone) {
+        redisSSLAsyncHandshake(ac);
+        return;
+    }
 
     rssl->pendingWrite = 0;
     rv = redisBufferWrite(c, &done);
