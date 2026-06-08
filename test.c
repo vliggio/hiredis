@@ -2345,6 +2345,57 @@ static void test_async_polling(struct config config) {
 }
 /* End of Async polling_adapter driven tests */
 
+#ifdef HIREDIS_TEST_SSL
+static void test_ssl_handshake_nonblocking(struct config config) {
+    redisContext *c;
+    struct pollfd pfd;
+    int rc;
+
+    /* Calling redisSSLHandshake() on a context whose handshake already completed
+     * (blocking connect path) must return DONE without error. */
+    test("redisSSLHandshake on completed blocking SSL context: ");
+    c = redisConnect(config.ssl.host, config.ssl.port);
+    assert(c && !c->err);
+    rc = redisInitiateSSLWithContext(c, _ssl_ctx);
+    assert(rc == REDIS_OK && !c->err);
+    rc = redisSSLHandshake(c);
+    test_cond(rc == REDIS_SSL_HANDSHAKE_DONE && !c->err);
+    redisFree(c);
+
+    /* On a non-blocking socket redisInitiateSSLWithContext() may return REDIS_OK
+     * before the TLS handshake finishes.  Drive it to completion via poll(2) +
+     * redisSSLHandshake() and verify the final return is DONE. */
+    test("redisSSLHandshake drives non-blocking TLS handshake to completion: ");
+    c = redisConnectNonBlock(config.ssl.host, config.ssl.port);
+    assert(c && !c->err);
+
+    /* Wait for the TCP connection to become writable (connect() completion). */
+    pfd.fd = c->fd;
+    pfd.events = POLLOUT;
+    rc = poll(&pfd, 1, 2000);
+    assert(rc == 1 && (pfd.revents & POLLOUT));
+
+    rc = redisInitiateSSLWithContext(c, _ssl_ctx);
+    assert(rc == REDIS_OK && !c->err);
+
+    int done = 0, iters = 0;
+    while (!done && iters++ < 100) {
+        rc = redisSSLHandshake(c);
+        if (rc == REDIS_SSL_HANDSHAKE_DONE) {
+            done = 1;
+        } else if (rc == REDIS_ERR) {
+            break;
+        } else {
+            pfd.fd = c->fd;
+            pfd.events = (rc == REDIS_SSL_HANDSHAKE_WANT_READ) ? POLLIN : POLLOUT;
+            poll(&pfd, 1, 2000);
+        }
+    }
+    test_cond(done && !c->err);
+    redisFree(c);
+}
+#endif /* HIREDIS_TEST_SSL */
+
 int main(int argc, char **argv) {
     struct config cfg = {
         .tcp = {
@@ -2460,6 +2511,7 @@ int main(int argc, char **argv) {
         test_invalid_timeout_errors(cfg);
         test_append_formatted_commands(cfg);
         if (throughput) test_throughput(cfg);
+        test_ssl_handshake_nonblocking(cfg);
 
         redisFreeSSLContext(_ssl_ctx);
         _ssl_ctx = NULL;
